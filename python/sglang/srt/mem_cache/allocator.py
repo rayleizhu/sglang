@@ -20,7 +20,8 @@ Page-aligned memory pool.
 """
 
 import abc
-from typing import TYPE_CHECKING
+import logging
+from typing import TYPE_CHECKING, Optional
 
 import torch
 import triton
@@ -29,7 +30,9 @@ import triton.language as tl
 from sglang.srt.utils import get_bool_env_var, get_num_new_pages, next_power_of_2
 
 if TYPE_CHECKING:
-    from sglang.srt.mem_cache.memory_pool import KVCache
+    from sglang.srt.mem_cache.memory_pool import BlockSparseTokenToKVPool, KVCache
+
+logger = logging.getLogger(__name__)
 
 
 class BaseTokenToKVPoolAllocator(abc.ABC):
@@ -351,6 +354,68 @@ def alloc_decode_kernel(
     else:
         page = tl.load(free_page_ptr + new_page_start_loc)
         tl.store(out_indices + pid, page * page_size)
+
+
+class BlockSparseTokenToKVPoolAllocator(TokenToKVPoolAllocator):
+    """Allocator for BlockSparseTokenToKVPool that co-manages summary slots.
+
+    Extends :class:`TokenToKVPoolAllocator` with a separate free-list for
+    summary pool slots.  Summary slots are allocated when a new block begins
+    (one slot per block) and freed when a request's KV cache is released.
+    """
+
+    def __init__(
+        self,
+        size: int,
+        dtype: torch.dtype,
+        device: str,
+        kvcache: BlockSparseTokenToKVPool,
+        need_sort: bool,
+    ):
+        # Block sparse config from the kvcache. Set BEFORE super().__init__()
+        # because the parent __init__ calls self.clear(), which is overridden
+        # here to reference these attributes.
+        self.block_size = kvcache.block_size
+        self.summary_pool_size = kvcache.summary_pool_size
+
+        super().__init__(size, dtype, device, kvcache, need_sort)
+
+        # Separate free-list for summary slots (slot 0 is reserved as padding)
+        self._summary_free_slots = torch.arange(
+            1, self.summary_pool_size + 1, dtype=torch.int64, device=device
+        )
+
+    def alloc_summary(self, need_size: int) -> Optional[torch.Tensor]:
+        """Allocate ``need_size`` summary pool slots.
+
+        Returns:
+            Int64 tensor of allocated slot indices, or None if OOM.
+        """
+        if need_size <= 0:
+            return torch.empty(0, dtype=torch.int64, device=self.device)
+        if need_size > len(self._summary_free_slots):
+            return None
+        select = self._summary_free_slots[:need_size]
+        self._summary_free_slots = self._summary_free_slots[need_size:]
+        return select
+
+    def free_summary(self, indices: torch.Tensor):
+        """Return summary pool slots to the free-list."""
+        if indices.numel() == 0:
+            return
+        self._summary_free_slots = torch.cat(
+            (self._summary_free_slots, indices.to(torch.int64))
+        )
+
+    def summary_available_size(self) -> int:
+        return len(self._summary_free_slots)
+
+    def clear(self):
+        super().clear()
+        self._summary_free_slots = torch.arange(
+            1, self.summary_pool_size + 1, dtype=torch.int64, device=self.device
+        )
+
 
 
 class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):

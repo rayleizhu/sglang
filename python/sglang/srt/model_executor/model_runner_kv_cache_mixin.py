@@ -9,10 +9,13 @@ from sglang.srt.configs.model_config import get_nsa_index_head_dim, is_deepseek_
 from sglang.srt.distributed.parallel_state import get_world_group
 from sglang.srt.layers.dp_attention import get_attention_tp_size
 from sglang.srt.mem_cache.allocator import (
+    BlockSparseTokenToKVPoolAllocator,
     PagedTokenToKVPoolAllocator,
     TokenToKVPoolAllocator,
 )
 from sglang.srt.mem_cache.memory_pool import (
+    BlockSparseReqToTokenPool,
+    BlockSparseTokenToKVPool,
     DoubleSparseTokenToKVPool,
     HybridLinearKVPool,
     HybridReqToTokenPool,
@@ -24,6 +27,10 @@ from sglang.srt.mem_cache.memory_pool import (
     ReqToTokenPool,
 )
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool, SWATokenToKVPoolAllocator
+from sglang.srt.mem_cache.seer_attn_memory_pool import (
+    SeerAttnReqToTokenPool,
+    SeerAttnTokenToKVPool,
+)
 from sglang.srt.utils.common import (
     get_available_gpu_memory,
     is_float4_e2m1fn_x2,
@@ -403,6 +410,24 @@ class ModelRunnerKVCacheMixin:
                     speculative_num_draft_tokens=self.server_args.speculative_num_draft_tokens,
                     enable_overlap_schedule=not self.server_args.disable_overlap_schedule,
                 )
+            elif self.server_args.attention_backend == "moba":
+                self.req_to_token_pool = BlockSparseReqToTokenPool(
+                    size=max_num_reqs,
+                    max_context_len=self.model_config.context_len
+                    + extra_max_context_len,
+                    device=self.device,
+                    enable_memory_saver=self.server_args.enable_memory_saver,
+                    block_size=self.model_config.blocksparse_attn.block_size,
+                )
+            elif self.server_args.attention_backend == "seer_attn":
+                self.req_to_token_pool = SeerAttnReqToTokenPool(
+                    size=max_num_reqs,
+                    max_context_len=self.model_config.context_len
+                    + extra_max_context_len,
+                    device=self.device,
+                    enable_memory_saver=self.server_args.enable_memory_saver,
+                    block_size=self.model_config.seer_attn.block_size,
+                )
             else:
                 self.req_to_token_pool = ReqToTokenPool(
                     size=max_num_reqs,
@@ -500,6 +525,43 @@ class ModelRunnerKVCacheMixin:
                     start_layer=self.start_layer,
                     end_layer=self.end_layer,
                 )
+        elif self.server_args.attention_backend == "moba":
+            summary_head_dim = getattr(self.model_config.blocksparse_attn, "summary_head_dim",
+                                       self.model_config.head_dim)
+            self.token_to_kv_pool = BlockSparseTokenToKVPool(
+                self.max_total_num_tokens,
+                page_size=self.page_size,
+                block_size=self.model_config.blocksparse_attn.block_size,
+                routing_mode=self.model_config.blocksparse_attn.routing_mode,
+                summary_head_dim=summary_head_dim,
+                dtype=self.kv_cache_dtype,
+                head_num=self.model_config.get_num_kv_heads(get_attention_tp_size()),
+                head_dim=self.model_config.head_dim,
+                layer_num=self.num_effective_layers,
+                device=self.device,
+                enable_memory_saver=self.server_args.enable_memory_saver,
+                start_layer=self.start_layer,
+                end_layer=self.end_layer,
+                max_num_reqs=max_num_reqs,
+            )
+
+        elif self.server_args.attention_backend == "seer_attn":
+            self.token_to_kv_pool = SeerAttnTokenToKVPool(
+                self.max_total_num_tokens,
+                page_size=self.page_size,
+                block_size=self.model_config.seer_attn.block_size,
+                gate_hidden_size=self.model_config.seer_attn.gate_hidden_size,
+                max_num_reqs=max_num_reqs,
+                dtype=self.kv_cache_dtype,
+                head_num=self.model_config.get_num_kv_heads(get_attention_tp_size()),
+                head_dim=self.model_config.head_dim,
+                layer_num=self.num_effective_layers,
+                device=self.device,
+                enable_memory_saver=self.server_args.enable_memory_saver,
+                start_layer=self.start_layer,
+                end_layer=self.end_layer,
+            )
+
         elif self.server_args.enable_double_sparsity:
             self.token_to_kv_pool = DoubleSparseTokenToKVPool(
                 self.max_total_num_tokens,
@@ -640,6 +702,16 @@ class ModelRunnerKVCacheMixin:
                         self.full_max_total_num_tokens,
                         self.swa_max_total_num_tokens,
                         page_size=self.page_size,
+                        dtype=self.kv_cache_dtype,
+                        device=self.device,
+                        kvcache=self.token_to_kv_pool,
+                        need_sort=need_sort,
+                    )
+                elif isinstance(self.token_to_kv_pool, BlockSparseTokenToKVPool):
+                    # Block-sparse attention: use the specialized allocator
+                    # that co-manages summary pool slots.
+                    self.token_to_kv_pool_allocator = BlockSparseTokenToKVPoolAllocator(
+                        self.max_total_num_tokens,
                         dtype=self.kv_cache_dtype,
                         device=self.device,
                         kvcache=self.token_to_kv_pool,

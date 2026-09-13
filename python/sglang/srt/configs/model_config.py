@@ -16,6 +16,7 @@ import json
 import logging
 import math
 import os
+from types import SimpleNamespace
 from enum import Enum, IntEnum, auto
 from pathlib import Path
 from typing import Any, List, Optional, Set, Union
@@ -103,6 +104,7 @@ class ModelConfig:
         encoder_only: bool = False,
         language_only: bool = False,
         disable_hybrid_swa_memory: bool = False,
+        attention_backend: Optional[str] = None,
     ) -> None:
         # Parse args
         self.model_path = model_path
@@ -114,6 +116,7 @@ class ModelConfig:
         self.quantize_and_serve = quantize_and_serve
         self.is_multi_layer_eagle = is_multi_layer_eagle
         self.disable_hybrid_swa_memory = disable_hybrid_swa_memory
+        self.attention_backend = attention_backend
 
         # Validate quantize_and_serve configuration
         self._validate_quantize_and_serve_config()
@@ -214,6 +217,12 @@ class ModelConfig:
         # Verify dual-chunk attention config
         self._verify_dual_chunk_attention_config()
 
+        if self.attention_backend == "moba":
+            self._resolve_and_verify_blocksparse_attn_config()
+
+        if self.attention_backend == "seer_attn":
+            self._resolve_and_verify_seer_attn_config()
+
         # Cache attributes
         self.hf_eos_token_id = self._get_hf_eos_token_id()
 
@@ -270,8 +279,129 @@ class ModelConfig:
             encoder_only=server_args.encoder_only,
             is_draft_model=is_draft_model,
             disable_hybrid_swa_memory=server_args.disable_hybrid_swa_memory,
+            attention_backend=server_args.attention_backend,
             **kwargs,
         )
+
+    def _resolve_and_verify_blocksparse_attn_config(self) -> None:
+        """
+        Resolve sparse attention config from multiple sources with the following priority (highest to lowest):
+        1. Environment variables
+        2. HF config
+        """
+        # collect configs
+        def _update_from_env(config, prefix):
+            if config is None:
+                config = SimpleNamespace()
+            for env_key, env_value in os.environ.items():
+                if env_key.startswith(prefix):
+                    key = env_key[len(prefix) :].lower()
+                    try:
+                        # Try to cast the value to the same type as the existing attribute
+                        old_value = getattr(config, key)
+                        setattr(config, key, type(old_value)(env_value))
+                    except (AttributeError, ValueError, TypeError):
+                        # If attribute doesn't exist or casting fails, keep as string or try to infer simple types
+                        if env_value.isdigit():
+                            setattr(config, key, int(env_value))
+                        else:
+                            setattr(config, key, env_value)
+            return config
+
+        bsa_cfg = getattr(self.hf_text_config, "blocksparse_attn", None)
+        bsa_cfg = getattr(self.hf_config, "blocksparse_attn", bsa_cfg)
+        bsa_cfg = _update_from_env(bsa_cfg, prefix="SGLANG_BSA_")
+
+        # verify the args
+        def _make_sure(cond:bool, msg:str):
+            if not cond:
+                raise ValueError(f"Blocksparse attention config error: {msg}")
+        
+        _make_sure(bsa_cfg is not None, "Blocksparse attention config is not found in model config or environment variables.")
+        _make_sure(getattr(bsa_cfg, "block_size", None) is not None, "block_size is required in blocksparse attention config.")
+        _make_sure(getattr(bsa_cfg, "topk", None) is not None, "topk is required in blocksparse attention config.")
+        _make_sure(getattr(bsa_cfg, "routing_mode", None) in {"per-group", "shared"}, 
+            "routing_mode in blocksparse attention config must be either 'per-group' or 'shared'.")
+        
+        self.blocksparse_attn = bsa_cfg
+
+    def _resolve_and_verify_seer_attn_config(self) -> None:
+        """Resolve the SeerAttention-R config for the ``seer_attn`` backend.
+
+        Architecture-level fields (block size, gate hidden size, pooling types,
+        qk-norm, rope) come from the ``seerattn_*`` keys baked into the
+        checkpoint's HF config by SeerAttention-R training.  Inference-time
+        knobs (sparsity method, threshold, token budget, start layer) default
+        to the values used by the reference reasoning-task eval and can be
+        overridden via ``SGLANG_SEER_*`` environment variables, e.g.
+        ``SGLANG_SEER_TOKEN_BUDGET=4096``.
+        """
+        hf = self.hf_text_config
+
+        def _hf(name, default=None):
+            return getattr(hf, name, default)
+
+        block_size = _hf("seerattn_gate_block_size")
+        gate_hidden_size = _hf("seerattn_gate_hidden_size")
+        if block_size is None or gate_hidden_size is None:
+            raise ValueError(
+                "seer_attn attention backend requires a SeerAttention-R "
+                "checkpoint (config must contain seerattn_gate_block_size and "
+                "seerattn_gate_hidden_size).  Did you point --model-path at the "
+                "AttnGates checkpoint?"
+            )
+
+        # This backend implements only the configuration used by every released
+        # Qwen3 decode AttnGate: Qproj + Kmaxminavg + qk-norm + RoPE.  Reject
+        # any checkpoint that declares a different variant rather than silently
+        # producing wrong gate scores.
+        for field, expected in (
+            ("seerattn_q_head_pooling_type", "Qproj"),
+            ("seerattn_k_seq_pooling_type", "Kmaxminavg"),
+            ("seerattn_use_qk_norm", True),
+            ("seerattn_use_rope", True),
+        ):
+            actual = _hf(field, expected)
+            if actual != expected:
+                raise ValueError(
+                    f"seer_attn backend only supports {field}={expected!r}, but "
+                    f"the checkpoint has {actual!r}. Other SeerAttention-R "
+                    "variants are not implemented."
+                )
+
+        cfg = SimpleNamespace(
+            block_size=int(block_size),
+            gate_hidden_size=int(gate_hidden_size),
+            # inference knobs (overridable via SGLANG_SEER_*)
+            sparsity_method=_hf("seerattn_sparsity_method", "token_budget"),
+            threshold=float(_hf("seerattn_threshold", 0.0)),
+            token_budget=int(_hf("seerattn_token_budget", 4096)),
+            start_layer=int(_hf("seerattn_start_layer", 0)),
+            base_model=getattr(self.hf_config, "base_model", None),
+        )
+
+        # Environment overrides for the inference knobs.
+        _env = {
+            "SGLANG_SEER_SPARSITY_METHOD": ("sparsity_method", str),
+            "SGLANG_SEER_THRESHOLD": ("threshold", float),
+            "SGLANG_SEER_TOKEN_BUDGET": ("token_budget", int),
+            "SGLANG_SEER_START_LAYER": ("start_layer", int),
+        }
+        for env_key, (attr, cast) in _env.items():
+            if env_key in os.environ:
+                setattr(cfg, attr, cast(os.environ[env_key]))
+
+        assert cfg.sparsity_method in {"threshold", "token_budget"}, (
+            f"Unsupported seerattn sparsity_method: {cfg.sparsity_method}"
+        )
+
+        self.seer_attn = cfg
+
+        # Stash the checkpoint path on the HF config so the model (which only
+        # receives hf_config at construction) can locate attn_gate_weights.pth.
+        self.hf_config.seer_attn_gate_path = self.model_path
+        # Also expose the resolved config to the model's decoder layers.
+        self.hf_config.seer_attn_cfg = cfg
 
     def _config_draft_model(self):
         is_draft_model = self.is_draft_model

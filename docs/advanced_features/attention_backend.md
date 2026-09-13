@@ -9,6 +9,11 @@ Selecting an optimal attention backend is crucial for maximizing your performanc
 If you don't specify `--attention-backend`, SGLang makes a best effort to automatically select the most performant backend based on your hardware and model architecture.
 ```
 
+The `seer_attn` and `moba` block-sparse backends are documented separately in
+[Block-Sparse Attention](./blocksparse_attention.md); they are opt-in and apply
+only to specific model/checkpoint combinations, so they are not listed in the
+general support matrix below.
+
 ## Support Matrix
 
 The support matrix is split into two parts: MHA (standard attention) and MLA (multi-head latent attention). For an explanation of the key differences between MHA and MLA, please see the [SGLang documentation on DeepSeek MLA](../basic_usage/deepseek_v3.md#multi-head-latent-attention-mla-throughput-optimizations) and the original [DeepSeek MLA paper](https://arxiv.org/pdf/2405.04434).

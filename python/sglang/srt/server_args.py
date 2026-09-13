@@ -123,6 +123,8 @@ ATTENTION_BACKEND_CHOICES = [
     # Common
     "triton",
     "torch_native",
+    "moba",
+    "seer_attn",
     "flex_attention",
     "nsa",
     # NVIDIA specific

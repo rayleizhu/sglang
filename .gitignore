@@ -1,3 +1,11 @@
+# pixi virtual environment
+.pixi/
+
+# Local development scaffolding (env bootstrap, notes, scratch scripts)
+/.devspace/
+/pyproject.toml
+/pixi.lock
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]

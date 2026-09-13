@@ -7,7 +7,12 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.srt.mem_cache.allocator import BlockSparseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache, EvictParams
+from sglang.srt.mem_cache.blocksparse_summary import (
+    _maybe_alloc_summary_slots,
+    _maybe_free_summary_for_release,
+)
 from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool, ReqToTokenPool
 from sglang.srt.mem_cache.swa_memory_pool import SWATokenToKVPoolAllocator
 from sglang.srt.server_args import get_global_server_args
@@ -388,6 +393,33 @@ def alloc_for_extend(
         batch.req_to_token_pool,
     )
 
+    # Allocate summary slots for block-sparse attention if applicable.
+    # is_first_extend: True iff this extend starts at position 0 (prefix_lens==0)
+    # — a genuine first chunk that must allocate summary slots from block 0.  A
+    # continuation chunk (prefix_lens>0) starts after the blocks earlier chunks
+    # already allocated (ceil(prefix/block_size)).
+    #
+    # We key on prefix_lens==0, NOT on req.is_chunked: the scheduler clears
+    # chunked_req (resetting is_chunked to 0) as it dispatches the FINAL chunk, so
+    # that chunk would read is_chunked<=1 == True and re-allocate from block 0,
+    # double-allocating every earlier block and leaking summary slots until the
+    # pool is exhausted (crash at long context).  prefix_lens is the source of
+    # truth and is robust to that counter timing.  Block-sparse backends disable
+    # radix cache, so a first extend never has a prefix-cache hit (prefix_lens>0
+    # with block-0 slots needed) — prefix_lens==0 is therefore exactly the set of
+    # extends that must start from block 0.
+    is_first_extend_cpu = prefix_lens_cpu == 0
+    _maybe_alloc_summary_slots(
+        batch.req_to_token_pool,
+        batch.token_to_kv_pool_allocator,
+        prefix_lens=prefix_lens_device,
+        seq_lens_after=batch.seq_lens,
+        req_pool_indices=req_pool_indices_device,
+        prefix_lens_cpu=prefix_lens_cpu,
+        seq_lens_after_cpu=batch.seq_lens_cpu,
+        is_first_extend_cpu=is_first_extend_cpu,
+    )
+
     return out_cache_loc, req_pool_indices_device, req_pool_indices
 
 
@@ -428,6 +460,19 @@ def alloc_for_decode(batch: ScheduleBatch, token_per_req: int) -> torch.Tensor:
         out_cache_loc: allocated cache locations
     """
 
+    # Guard: req_to_token_pool.write and _maybe_alloc_summary_slots currently
+    # assume exactly 1 new token per request.  Supporting token_per_req > 1
+    # requires writing multiple positions and passing the correct
+    # seq_lens_after to _maybe_alloc_summary_slots.
+    if token_per_req != 1:
+        raise NotImplementedError(
+            f"alloc_for_decode only supports token_per_req=1 for now, "
+            f"got token_per_req={token_per_req}. "
+            f"The req_to_token_pool write logic and "
+            f"_maybe_alloc_summary_slots need to be updated to handle "
+            f"multiple tokens per request."
+        )
+
     batch.maybe_evict_swa()
 
     bs = batch.seq_lens.shape[0]
@@ -459,6 +504,19 @@ def alloc_for_decode(batch: ScheduleBatch, token_per_req: int) -> torch.Tensor:
         (batch.req_pool_indices, locs), out_cache_loc.to(torch.int32)
     )
 
+    # Allocate summary slots for block-sparse attention if applicable.
+    # At this point seq_lens has NOT been incremented yet — the new token
+    # goes to position seq_lens[i] (0-indexed). batch.prefix_lens has undefined values.
+    _maybe_alloc_summary_slots(
+        batch.req_to_token_pool,
+        batch.token_to_kv_pool_allocator,
+        prefix_lens=batch.seq_lens,  # old seq_lens = prefix for the 1 new token
+        seq_lens_after=batch.seq_lens + 1,  # after decode
+        req_pool_indices=batch.req_pool_indices,
+        prefix_lens_cpu=batch.seq_lens_cpu,  # CPU mirror of prefix_lens
+        seq_lens_after_cpu=batch.seq_lens_cpu + 1,  # CPU mirror of seq_lens_after
+    )
+
     return out_cache_loc
 
 
@@ -483,6 +541,20 @@ def release_kv_cache(req: Req, tree_cache: BasePrefixCache, is_insert: bool = Tr
     # cleanup (overalloc free + pool slot free). This means over-allocated
     # tokens from speculative decoding are NOT freed between turns.
     if req.req_pool_idx is None:
+        # NOTE: block-sparse backends (seer_attn/moba) would leak summary slots
+        # on this early return, since _maybe_free_summary_for_release below
+        # never runs and it keys on req_pool_idx.  Those backends disable radix
+        # cache (-> ChunkCache, which never nulls req_pool_idx here) and are
+        # incompatible with SessionAwareCache, so this path is unreachable for
+        # them; assert it rather than silently leak if that ever changes.
+        assert not isinstance(
+            tree_cache.token_to_kv_pool_allocator,
+            BlockSparseTokenToKVPoolAllocator,
+        ), (
+            "block-sparse summary slots would leak: release_kv_cache hit the "
+            "req_pool_idx-is-None transfer path (e.g. SessionAwareCache) before "
+            "freeing summary slots, which a block-sparse backend does not support."
+        )
         return
 
     start_p, end_p = req.pop_overallocated_kv_cache()
@@ -504,6 +576,10 @@ def release_kv_cache(req: Req, tree_cache: BasePrefixCache, is_insert: bool = Tr
             start_p:end_p
         ]
         tree_cache.token_to_kv_pool_allocator.free(indices_to_free)
+
+    # Free block-sparse summary slots if applicable.
+    _maybe_free_summary_for_release(req, tree_cache)
+
     # If the prefix cache doesn't manage mamba states, we must free them here.
     if isinstance(tree_cache.req_to_token_pool, HybridReqToTokenPool) and (
         not tree_cache.supports_mamba()

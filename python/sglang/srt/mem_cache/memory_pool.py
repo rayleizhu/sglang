@@ -133,14 +133,14 @@ class ReqToTokenPool:
         device: str,
         enable_memory_saver: bool,
     ):
-        memory_saver_adapter = TorchMemorySaverAdapter.create(
+        self.memory_saver_adapter = TorchMemorySaverAdapter.create(
             enable=enable_memory_saver
         )
 
         self.size = size
         self.max_context_len = max_context_len
         self.device = device
-        with memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
+        with self.memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
             self.req_to_token = torch.zeros(
                 (size, max_context_len), dtype=torch.int32, device=device
             )
@@ -184,6 +184,39 @@ class ReqToTokenPool:
     def clear(self):
         self.free_slots = list(range(self.size))
 
+
+class BlockSparseReqToTokenPool(ReqToTokenPool):
+    """Extension of :class:`ReqToTokenPool` that adds a ``req_to_summary``
+    index table for block-sparse attention.
+
+    ``req_to_summary[req_pool_idx, logical_block_id]`` stores the summary-pool
+    slot that holds the rolling-mean key summary for that block.  Slot 0 is
+    reserved as an invalid/padding value.
+    """
+
+    def __init__(
+        self,
+        size: int,
+        max_context_len: int,
+        device: str,
+        enable_memory_saver: bool,
+        block_size: int,
+    ):
+        super().__init__(size, max_context_len, device, enable_memory_saver)
+        self.block_size = block_size
+        self.max_num_summary = (max_context_len + block_size - 1) // block_size
+
+        # (req_pool_idx, logical_block_id) -> summary_pool_slot  (0 = empty)
+        with self.memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
+            self.req_to_summary = torch.zeros(
+                (size, self.max_num_summary),
+                dtype=torch.int32,
+                device=device,
+            )
+
+    def clear(self):
+        super().clear()
+        self.req_to_summary.zero_() # NOTE: defensive guard, slot 0 is a sentinel slot
 
 class MambaPool:
     @dataclass(frozen=True, kw_only=True)
@@ -1062,6 +1095,101 @@ class MHATokenToKVPool(KVCache):
                 num_warps=cfg["num_warps"],
                 num_stages=2,
             )
+
+
+class BlockSparseTokenToKVPool(MHATokenToKVPool):
+    """KV cache pool with block-level key summary cache for sparse attention.
+
+    Alongside the standard KV cache (k_buffer, v_buffer), this pool maintains:
+
+    - ``summary_buffer``: per-layer list of ``[summary_pool_size+1, head_num, summary_head_dim]``
+      tensors holding rolling-mean key summaries for each block.
+
+    The request-level ``req_to_summary`` mapping lives on
+    :class:`BlockSparseReqToTokenPool`, following SGLang's convention of keeping
+    request-level index tables on the req-to-token pool.
+    """
+
+    def __init__(
+        self,
+        size: int,
+        page_size: int,
+        block_size: int,
+        routing_mode: str,
+        summary_head_dim: int,
+        dtype: torch.dtype,
+        head_num: int,
+        head_dim: int,
+        layer_num: int,
+        device: str,
+        enable_memory_saver: bool,
+        start_layer: Optional[int] = None,
+        end_layer: Optional[int] = None,
+        max_num_reqs: int = 0,
+    ):
+        # Set block-sparse attributes before super().__init__() so that
+        # _create_buffers() (called by MHATokenToKVPool.__init__) can use them.
+        self.block_size = block_size
+        self.routing_mode = routing_mode
+        self.summary_head_dim = summary_head_dim
+        # Summary slots are allocated eagerly per (request, touched block),
+        # *including* each request's current partial tail block.  The total
+        # demand is therefore Σ ceil(len_i / block_size), whose worst case
+        # (many short requests) exceeds ceil(Σ len_i / block_size) = the KV-cache
+        # block count by up to one slot per concurrent request.  Add a
+        # max_num_reqs margin so a high-concurrency / short-context batch cannot
+        # spuriously exhaust the summary pool before the KV cache itself fills
+        # (the latter is what should drive retraction).
+        self.summary_pool_size = (size + block_size - 1) // block_size + max_num_reqs
+
+        super().__init__(
+            size=size,
+            page_size=page_size,
+            dtype=dtype,
+            head_num=head_num,
+            head_dim=head_dim,
+            layer_num=layer_num,
+            device=device,
+            enable_memory_saver=enable_memory_saver,
+            start_layer=start_layer,
+            end_layer=end_layer,
+            enable_alt_stream=True,
+            enable_kv_cache_copy=False,
+        )
+
+    def _create_buffers(self):
+        super()._create_buffers()
+        # Summary buffer: one per layer.  Slot 0 is reserved as padding.
+        with self.memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
+            with (
+                torch.cuda.use_mem_pool(self.custom_mem_pool)
+                if self.enable_custom_mem_pool
+                else nullcontext()
+            ):
+                self.summary_buffer = [
+                    torch.zeros(
+                        (
+                            self.summary_pool_size + 1,
+                            self.head_num,
+                            self.summary_head_dim,
+                        ),
+                        dtype=self.store_dtype,
+                        device=self.device,
+                    )
+                    for _ in range(self.layer_num)
+                ]
+
+    def get_summary_buffer(self, layer_id: int) -> torch.Tensor:
+        return self.summary_buffer[layer_id - self.start_layer]
+
+    def set_summary_buffer(
+        self,
+        layer: "RadixAttention",
+        loc: torch.Tensor,
+        summary: torch.Tensor,
+    ):
+        layer_id = layer.layer_id
+        self.summary_buffer[layer_id - self.start_layer][loc] = summary
 
 
 class MHATokenToKVPoolFP4(MHATokenToKVPool):

@@ -677,6 +677,77 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             server_args.attention_backend = "triton"
             server_args.disable_cuda_graph = True
 
+        # MoBA and SeerAttention-R both support full CUDA graph for decode (their
+        # decode KV-index expansion writes into a fixed pre-allocated buffer and
+        # their per-step summary update uses a fixed-grid, sync-free kernel).
+        if server_args.attention_backend in {"seer_attn", "moba"}:
+            # Both support full CUDA graph for decode, but not the piecewise
+            # graph / torch.compile path: their dense prefill builds block
+            # summaries via host-scheduled Triton kernels (and for SeerAttention-R
+            # piecewise's split op would also drop the per-layer gate kwargs).
+            server_args.disable_piecewise_cuda_graph = True
+            server_args.enable_torch_compile = False
+
+        # SeerAttention-R builds its per-block gate summaries during dense prefill
+        # and keeps a per-request rolling cache of the trailing partial block.
+        # Prefix-cache reuse (radix cache) is always disabled to match the
+        # reference dense-prefill behavior.  Chunked prefill is OPT-IN via
+        # SGLANG_SEER_ENABLE_CHUNKED_PREFILL: the summary/rolling build now carries
+        # per-request prefix block offsets (see build_prefill_summary_schedule), so
+        # a chunk starting mid-request writes to the correct global slots — PROVIDED
+        # each chunk boundary is block_size-aligned (a complete block must not
+        # straddle two chunks).  We therefore snap chunked_prefill_size DOWN to a
+        # multiple of block_size when chunking is enabled.  Enabling this lets long
+        # contexts (512k/1M) prefill with constant activation instead of OOMing on a
+        # single one-shot prefill of the whole sequence.
+        if server_args.attention_backend == "seer_attn":
+            if not server_args.disable_radix_cache:
+                logger.warning(
+                    "seer_attn attention backend disables radix (prefix) cache "
+                    "to match the reference dense-prefill behavior."
+                )
+                server_args.disable_radix_cache = True
+
+            enable_chunked = (
+                os.environ.get("SGLANG_SEER_ENABLE_CHUNKED_PREFILL", "0") == "1"
+            )
+            block_size = int(os.environ.get("SGLANG_SEER_BLOCK_SIZE", "64"))
+            if not enable_chunked:
+                if server_args.chunked_prefill_size != -1:
+                    logger.warning(
+                        "seer_attn attention backend disables chunked prefill by "
+                        "default (set SGLANG_SEER_ENABLE_CHUNKED_PREFILL=1 to enable "
+                        "the block-aligned chunked path)."
+                    )
+                    server_args.chunked_prefill_size = -1
+            else:
+                cps = server_args.chunked_prefill_size
+                if cps == -1:
+                    logger.warning(
+                        "SGLANG_SEER_ENABLE_CHUNKED_PREFILL=1 but chunked_prefill_size"
+                        " is -1 (disabled); keeping single-chunk prefill. Pass "
+                        "--chunked-prefill-size <multiple of %d> to actually chunk.",
+                        block_size,
+                    )
+                elif cps % block_size != 0:
+                    aligned = max(block_size, (cps // block_size) * block_size)
+                    logger.warning(
+                        "seer_attn chunked prefill requires chunked_prefill_size "
+                        "aligned to block_size=%d (a complete block must not straddle"
+                        " a chunk); snapping %d -> %d.",
+                        block_size,
+                        cps,
+                        aligned,
+                    )
+                    server_args.chunked_prefill_size = aligned
+                else:
+                    logger.info(
+                        "seer_attn chunked prefill ENABLED (chunked_prefill_size=%d,"
+                        " block_size=%d, aligned).",
+                        cps,
+                        block_size,
+                    )
+
         if self.is_multimodal:
             if not self.is_multimodal_chunked_prefill_supported:
                 server_args.chunked_prefill_size = -1

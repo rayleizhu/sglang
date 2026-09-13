@@ -109,6 +109,24 @@ def create_torch_native_backend(runner):
     return TorchNativeAttnBackend(runner)
 
 
+@register_attention_backend("seer_attn")
+def create_seer_attn_backend(runner):
+    from sglang.srt.layers.attention.blocksparse.seer_attn.backend import (
+        SeerAttnBackend,
+    )
+
+    return SeerAttnBackend(runner)
+
+
+@register_attention_backend("moba")
+def create_moba_backend(runner):
+    from sglang.srt.layers.attention.blocksparse.moba.backend import (
+        MobaAttnBackend,
+    )
+
+    return MobaAttnBackend(runner)
+
+
 @register_attention_backend("flex_attention")
 def create_flex_attention_backend(runner):
     from sglang.srt.layers.attention.torch_flex_backend import TorchFlexAttnBackend

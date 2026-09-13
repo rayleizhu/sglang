@@ -1130,7 +1130,7 @@ class FlashInferIndicesUpdaterDecode:
             and wrapper.begin_forward.func == fast_decode_plan
         )
 
-        if wrapper_uses_fast_decode_plan:
+        if wrapper_uses_fast_decode_plan: # only for cudagraph capturing stage
             # When begin_forward is replaced with fast_decode_plan, pass global_override_indptr_cpu
             wrapper.begin_forward(
                 kv_indptr,
