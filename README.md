@@ -1,6 +1,6 @@
 # Block-Sparse Attention for SGLang
 
-A fork of [SGLang](https://github.com/sgl-project/sglang) that adds **block-sparse
+A fork of [SGLang](https://github.com/sgl-project/sglang) (from [v0.5.9](https://github.com/rayleizhu/sglang/tree/v0.5.9)) that adds **block-sparse
 decode attention** backends: prefill stays dense, and each decode step attends
 only a selected subset of KV *blocks* instead of the whole context.
 
